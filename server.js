@@ -16,8 +16,11 @@ const SUPABASE_URL = process.env.SUPABASE_URL;
 const SUPABASE_SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY;
 const MP_ACCESS_TOKEN = process.env.MP_ACCESS_TOKEN;
 
-const BACKEND_PUBLIC_URL =
-  process.env.BACKEND_PUBLIC_URL || "https://vaga-facil-backend.onrender.com";
+const MP_PLAN_MENSAL =
+  process.env.MP_PLAN_MENSAL || "ca92e94590464e44b834d5bb61454732";
+
+const MP_PLAN_TRIMESTRAL =
+  process.env.MP_PLAN_TRIMESTRAL || "9786832ee8224e78b048956df6963dc2";
 
 if (!SUPABASE_URL || !SUPABASE_SERVICE_ROLE_KEY || !MP_ACCESS_TOKEN) {
   console.error("Erro: variáveis de ambiente obrigatórias ausentes.");
@@ -52,8 +55,11 @@ function dadosDoPlano(plan) {
     return {
       plan: "mensal",
       titulo: "Vaga Fácil - Plano Mensal",
-      valor: 9.99,
-      dias: 35
+      planId: MP_PLAN_MENSAL,
+      diasFallback: 35,
+      checkoutUrl:
+        "https://www.mercadopago.com.br/subscriptions/checkout?preapproval_plan_id=" +
+        MP_PLAN_MENSAL
     };
   }
 
@@ -61,11 +67,20 @@ function dadosDoPlano(plan) {
     return {
       plan: "trimestral",
       titulo: "Vaga Fácil - Plano Trimestral",
-      valor: 26.99,
-      dias: 100
+      planId: MP_PLAN_TRIMESTRAL,
+      diasFallback: 100,
+      checkoutUrl:
+        "https://www.mercadopago.com.br/subscriptions/checkout?preapproval_plan_id=" +
+        MP_PLAN_TRIMESTRAL
     };
   }
 
+  return null;
+}
+
+function planoPorPlanId(planId) {
+  if (planId === MP_PLAN_MENSAL) return dadosDoPlano("mensal");
+  if (planId === MP_PLAN_TRIMESTRAL) return dadosDoPlano("trimestral");
   return null;
 }
 
@@ -73,6 +88,40 @@ function adicionarDias(dias) {
   const data = new Date();
   data.setDate(data.getDate() + dias);
   return data.toISOString();
+}
+
+function mapearStatusAssinatura(statusMp) {
+  const status = String(statusMp || "").toLowerCase();
+
+  if (status === "authorized" || status === "active" || status === "approved") {
+    return "active";
+  }
+
+  if (status === "paused") {
+    return "paused";
+  }
+
+  if (status === "cancelled" || status === "canceled") {
+    return "cancelled";
+  }
+
+  if (status === "expired") {
+    return "expired";
+  }
+
+  return "pending";
+}
+
+function calcularExpiracao(assinatura, plano) {
+  if (assinatura && assinatura.next_payment_date) {
+    const data = new Date(assinatura.next_payment_date);
+
+    if (!Number.isNaN(data.getTime())) {
+      return data.toISOString();
+    }
+  }
+
+  return adicionarDias(plano ? plano.diasFallback : 35);
 }
 
 async function chamarMercadoPago(path, method = "GET", body = null) {
@@ -95,35 +144,217 @@ async function chamarMercadoPago(path, method = "GET", body = null) {
   return data;
 }
 
-async function ativarLicencaPorReferencia(externalReference, paymentId = null) {
-  const { data: licenca, error: buscaErro } = await supabase
+async function buscarLicencaAtivaOutroAparelho(email, deviceId) {
+  const { data, error } = await supabase
+    .from("licenses")
+    .select("device_id, status, expires_at")
+    .eq("email", email)
+    .eq("status", "active")
+    .neq("device_id", deviceId);
+
+  if (error) {
+    throw error;
+  }
+
+  const agora = new Date();
+
+  return (data || []).some((item) => {
+    if (!item.expires_at) return false;
+
+    const expira = new Date(item.expires_at);
+
+    return (
+      item.device_id &&
+      item.device_id !== deviceId &&
+      !Number.isNaN(expira.getTime()) &&
+      expira > agora
+    );
+  });
+}
+
+async function buscarAssinaturaAtivaPorEmailEPlano(email, plano) {
+  const params = new URLSearchParams();
+  params.set("payer_email", email);
+  params.set("preapproval_plan_id", plano.planId);
+  params.set("limit", "20");
+
+  const resultado = await chamarMercadoPago(
+    `/preapproval/search?${params.toString()}`,
+    "GET"
+  );
+
+  const assinaturas = Array.isArray(resultado.results)
+    ? resultado.results
+    : [];
+
+  const ativas = assinaturas
+    .filter((assinatura) => {
+      const status = String(assinatura.status || "").toLowerCase();
+
+      return (
+        assinatura.preapproval_plan_id === plano.planId &&
+        (status === "authorized" || status === "active")
+      );
+    })
+    .sort((a, b) => {
+      const dataA = new Date(a.date_created || a.last_modified || 0).getTime();
+      const dataB = new Date(b.date_created || b.last_modified || 0).getTime();
+      return dataB - dataA;
+    });
+
+  return ativas[0] || null;
+}
+
+async function buscarAssinaturaAtivaPorEmail(email, planoPreferido = null) {
+  const planos = [];
+
+  if (planoPreferido) {
+    const plano = dadosDoPlano(planoPreferido);
+    if (plano) planos.push(plano);
+  }
+
+  if (!planos.some((p) => p.plan === "mensal")) {
+    planos.push(dadosDoPlano("mensal"));
+  }
+
+  if (!planos.some((p) => p.plan === "trimestral")) {
+    planos.push(dadosDoPlano("trimestral"));
+  }
+
+  for (const plano of planos) {
+    if (!plano) continue;
+
+    const assinatura = await buscarAssinaturaAtivaPorEmailEPlano(email, plano);
+
+    if (assinatura) {
+      return {
+        assinatura,
+        plano
+      };
+    }
+  }
+
+  return null;
+}
+
+async function ativarLicencaComAssinatura({
+  email,
+  deviceId,
+  plano,
+  assinatura
+}) {
+  const outroAparelho = await buscarLicencaAtivaOutroAparelho(email, deviceId);
+
+  if (outroAparelho) {
+    return {
+      ok: false,
+      active: false,
+      status: "email_usado_em_outro_aparelho",
+      plan: plano.plan,
+      expires_at: null
+    };
+  }
+
+  const status = mapearStatusAssinatura(assinatura.status);
+  const expiresAt =
+    status === "active" ? calcularExpiracao(assinatura, plano) : null;
+
+  const { error } = await supabase
+    .from("licenses")
+    .update({
+      plan: plano.plan,
+      status,
+      mp_preapproval_id: assinatura.id || null,
+      expires_at: expiresAt
+    })
+    .eq("email", email)
+    .eq("device_id", deviceId);
+
+  if (error) {
+    throw error;
+  }
+
+  return {
+    ok: true,
+    active: status === "active",
+    status,
+    plan: plano.plan,
+    expires_at: expiresAt
+  };
+}
+
+async function processarAssinaturaMercadoPago(assinatura) {
+  const planId = assinatura.preapproval_plan_id;
+  const plano = planoPorPlanId(planId);
+
+  if (!plano) {
+    return {
+      updated: false,
+      reason: "Plano não reconhecido.",
+      planId
+    };
+  }
+
+  const email = limparEmail(
+    assinatura.payer_email ||
+      assinatura.payer?.email ||
+      assinatura.subscriber?.email
+  );
+
+  if (!email) {
+    return {
+      updated: false,
+      reason: "Assinatura sem e-mail."
+    };
+  }
+
+  const status = mapearStatusAssinatura(assinatura.status);
+  const expiresAt =
+    status === "active" ? calcularExpiracao(assinatura, plano) : null;
+
+  let { data: licenca, error: erroBusca } = await supabase
     .from("licenses")
     .select("*")
-    .eq("external_reference", externalReference)
+    .eq("mp_preapproval_id", assinatura.id)
     .maybeSingle();
 
-  if (buscaErro) {
-    throw buscaErro;
+  if (erroBusca) {
+    throw erroBusca;
+  }
+
+  if (!licenca) {
+    const buscaPendente = await supabase
+      .from("licenses")
+      .select("*")
+      .eq("email", email)
+      .eq("plan", plano.plan)
+      .in("status", ["pending", "active", "paused"])
+      .order("updated_at", { ascending: false })
+      .limit(1);
+
+    if (buscaPendente.error) {
+      throw buscaPendente.error;
+    }
+
+    licenca = buscaPendente.data && buscaPendente.data[0];
   }
 
   if (!licenca) {
     return {
       updated: false,
-      reason: "Licença não encontrada."
+      reason: "Nenhuma licença pendente encontrada para esse e-mail."
     };
   }
-
-  const plano = dadosDoPlano(licenca.plan || "mensal");
-  const expiresAt = adicionarDias(plano ? plano.dias : 35);
 
   const { error: updateError } = await supabase
     .from("licenses")
     .update({
-      status: "active",
-      expires_at: expiresAt,
-      mp_preapproval_id: paymentId ? String(paymentId) : licenca.mp_preapproval_id
+      plan: plano.plan,
+      status,
+      mp_preapproval_id: assinatura.id || null,
+      expires_at: expiresAt
     })
-    .eq("external_reference", externalReference);
+    .eq("id", licenca.id);
 
   if (updateError) {
     throw updateError;
@@ -131,24 +362,62 @@ async function ativarLicencaPorReferencia(externalReference, paymentId = null) {
 
   return {
     updated: true,
-    status: "active",
-    plan: licenca.plan,
+    email,
+    device_id: licenca.device_id,
+    status,
+    plan: plano.plan,
     expires_at: expiresAt
   };
 }
 
-async function buscarPagamentoAprovadoPorReferencia(externalReference) {
-  const encodedRef = encodeURIComponent(externalReference);
+async function processarPagamentoMercadoPago(pagamento) {
+  const email = limparEmail(pagamento.payer?.email || "");
 
-  const result = await chamarMercadoPago(
-    `/v1/payments/search?external_reference=${encodedRef}`,
-    "GET"
-  );
+  if (!email) {
+    return {
+      updated: false,
+      reason: "Pagamento sem e-mail do pagador."
+    };
+  }
 
-  const pagamentos = Array.isArray(result.results) ? result.results : [];
+  const resultado = await buscarAssinaturaAtivaPorEmail(email);
 
-  return pagamentos.find((pagamento) => {
-    return String(pagamento.status || "").toLowerCase() === "approved";
+  if (!resultado) {
+    return {
+      updated: false,
+      reason: "Nenhuma assinatura ativa encontrada para o e-mail."
+    };
+  }
+
+  const { assinatura, plano } = resultado;
+
+  const { data: licencas, error } = await supabase
+    .from("licenses")
+    .select("*")
+    .eq("email", email)
+    .eq("plan", plano.plan)
+    .in("status", ["pending", "active", "paused"])
+    .order("updated_at", { ascending: false })
+    .limit(1);
+
+  if (error) {
+    throw error;
+  }
+
+  const licenca = licencas && licencas[0];
+
+  if (!licenca) {
+    return {
+      updated: false,
+      reason: "Licença não encontrada para o pagamento."
+    };
+  }
+
+  return ativarLicencaComAssinatura({
+    email,
+    deviceId: licenca.device_id,
+    plano,
+    assinatura
   });
 }
 
@@ -156,13 +425,15 @@ app.get("/", (req, res) => {
   res.json({
     ok: true,
     app: "Vaga Fácil Backend",
-    status: "online"
+    status: "online",
+    mode: "recurring-subscription"
   });
 });
 
 app.get("/health", (req, res) => {
   res.json({
     ok: true,
+    mode: "recurring-subscription",
     time: new Date().toISOString()
   });
 });
@@ -189,10 +460,23 @@ app.post("/api/create-checkout", async (req, res) => {
 
     const plano = dadosDoPlano(plan);
 
-    if (!plano) {
+    if (!plano || !plano.planId) {
       return res.status(400).json({
         ok: false,
         error: "Plano inválido."
+      });
+    }
+
+    const outroAparelho = await buscarLicencaAtivaOutroAparelho(
+      email,
+      deviceId
+    );
+
+    if (outroAparelho) {
+      return res.status(403).json({
+        ok: false,
+        error:
+          "Este e-mail já está vinculado a outro aparelho ativo. Fale com o suporte."
       });
     }
 
@@ -208,7 +492,7 @@ app.post("/api/create-checkout", async (req, res) => {
           plan: plano.plan,
           status: "pending",
           external_reference: externalReference,
-          checkout_url: null,
+          checkout_url: plano.checkoutUrl,
           mp_preapproval_id: null,
           expires_at: null
         },
@@ -221,51 +505,14 @@ app.post("/api/create-checkout", async (req, res) => {
       throw upsertError;
     }
 
-    const preference = await chamarMercadoPago("/checkout/preferences", "POST", {
-      items: [
-        {
-          title: plano.titulo,
-          quantity: 1,
-          unit_price: plano.valor,
-          currency_id: "BRL"
-        }
-      ],
-      payer: {
-        email
-      },
-      external_reference: externalReference,
-      notification_url: `${BACKEND_PUBLIC_URL}/webhook/mercadopago`,
-      back_urls: {
-        success: BACKEND_PUBLIC_URL,
-        failure: BACKEND_PUBLIC_URL,
-        pending: BACKEND_PUBLIC_URL
-      },
-      auto_return: "approved",
-      statement_descriptor: "VAGA FACIL"
-    });
-
-    const checkoutUrl =
-      preference.init_point ||
-      preference.sandbox_init_point ||
-      null;
-
-    const { error: updateError } = await supabase
-      .from("licenses")
-      .update({
-        checkout_url: checkoutUrl,
-        mp_preapproval_id: preference.id || null
-      })
-      .eq("external_reference", externalReference);
-
-    if (updateError) {
-      throw updateError;
-    }
-
     return res.json({
       ok: true,
-      checkout_url: checkoutUrl,
+      recurring: true,
+      checkout_url: plano.checkoutUrl,
       external_reference: externalReference,
-      preference_id: preference.id || null
+      plan: plano.plan,
+      message:
+        "Use no Mercado Pago o mesmo e-mail informado no app para liberar automaticamente."
     });
   } catch (error) {
     console.error("create-checkout error:", {
@@ -275,7 +522,7 @@ app.post("/api/create-checkout", async (req, res) => {
 
     return res.status(500).json({
       ok: false,
-      error: "Erro ao criar checkout.",
+      error: "Erro ao criar checkout recorrente.",
       details: String(error.message || error)
     });
   }
@@ -296,7 +543,9 @@ app.get("/api/check-license", async (req, res) => {
 
     const { data, error } = await supabase
       .from("licenses")
-      .select("email, device_id, plan, status, expires_at, updated_at, external_reference")
+      .select(
+        "id, email, device_id, plan, status, expires_at, updated_at, external_reference, mp_preapproval_id"
+      )
       .eq("email", email)
       .eq("device_id", deviceId)
       .maybeSingle();
@@ -317,30 +566,57 @@ app.get("/api/check-license", async (req, res) => {
 
     let licencaAtual = data;
 
-    if (data.status !== "active" && data.external_reference) {
+    const agora = new Date();
+    const expiraAtual = licencaAtual.expires_at
+      ? new Date(licencaAtual.expires_at)
+      : null;
+
+    const aindaAtiva =
+      licencaAtual.status === "active" &&
+      expiraAtual instanceof Date &&
+      !Number.isNaN(expiraAtual.getTime()) &&
+      expiraAtual > agora;
+
+    if (!aindaAtiva) {
       try {
-        const pagamentoAprovado = await buscarPagamentoAprovadoPorReferencia(
-          data.external_reference
+        const resultado = await buscarAssinaturaAtivaPorEmail(
+          email,
+          data.plan
         );
 
-        if (pagamentoAprovado) {
-          const ativada = await ativarLicencaPorReferencia(
-            data.external_reference,
-            pagamentoAprovado.id
-          );
+        if (resultado) {
+          const ativada = await ativarLicencaComAssinatura({
+            email,
+            deviceId,
+            plano: resultado.plano,
+            assinatura: resultado.assinatura
+          });
+
+          if (!ativada.ok) {
+            return res.json({
+              ok: true,
+              active: false,
+              status: ativada.status,
+              plan: ativada.plan,
+              expires_at: null
+            });
+          }
 
           licencaAtual = {
-            ...data,
-            status: "active",
+            ...licencaAtual,
+            status: ativada.status,
+            plan: ativada.plan,
             expires_at: ativada.expires_at
           };
         }
       } catch (mpError) {
-        console.error("Erro ao consultar pagamento no Mercado Pago:", mpError);
+        console.error("Erro ao consultar assinatura no Mercado Pago:", {
+          message: String(mpError.message || mpError),
+          details: mpError
+        });
       }
     }
 
-    const agora = new Date();
     const expira = licencaAtual.expires_at
       ? new Date(licencaAtual.expires_at)
       : null;
@@ -349,7 +625,7 @@ app.get("/api/check-license", async (req, res) => {
       licencaAtual.status === "active" &&
       expira instanceof Date &&
       !Number.isNaN(expira.getTime()) &&
-      expira > agora;
+      expira > new Date();
 
     return res.json({
       ok: true,
@@ -408,51 +684,38 @@ app.post("/webhook/mercadopago", async (req, res) => {
 
     const tipo = String(eventType).toLowerCase();
 
-    if (!tipo.includes("payment") && !tipo.includes("pagamento")) {
-      return res.json({
-        ok: true,
-        ignored: true,
-        reason: "Evento não é de pagamento.",
-        eventType
-      });
-    }
-
-    const pagamento = await chamarMercadoPago(`/v1/payments/${mpId}`, "GET");
-
-    const status = String(pagamento.status || "").toLowerCase();
-    const externalReference = pagamento.external_reference;
-
-    if (!externalReference) {
-      return res.json({
-        ok: true,
-        ignored: true,
-        reason: "Pagamento sem external_reference."
-      });
-    }
-
-    if (status !== "approved") {
-      await supabase
-        .from("licenses")
-        .update({
-          status: status === "cancelled" ? "cancelled" : "pending",
-          mp_preapproval_id: String(mpId)
-        })
-        .eq("external_reference", externalReference);
+    if (
+      tipo.includes("preapproval") ||
+      tipo.includes("subscription") ||
+      tipo.includes("assinatura") ||
+      tipo.includes("plan")
+    ) {
+      const assinatura = await chamarMercadoPago(`/preapproval/${mpId}`, "GET");
+      const resultado = await processarAssinaturaMercadoPago(assinatura);
 
       return res.json({
         ok: true,
-        updated: true,
-        status,
-        active: false
+        eventType,
+        ...resultado
       });
     }
 
-    const ativada = await ativarLicencaPorReferencia(externalReference, mpId);
+    if (tipo.includes("payment") || tipo.includes("pagamento")) {
+      const pagamento = await chamarMercadoPago(`/v1/payments/${mpId}`, "GET");
+      const resultado = await processarPagamentoMercadoPago(pagamento);
+
+      return res.json({
+        ok: true,
+        eventType,
+        ...resultado
+      });
+    }
 
     return res.json({
       ok: true,
-      active: true,
-      ...ativada
+      ignored: true,
+      reason: "Evento não tratado.",
+      eventType
     });
   } catch (error) {
     console.error("webhook error:", {
