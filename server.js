@@ -16,6 +16,9 @@ const SUPABASE_URL = process.env.SUPABASE_URL;
 const SUPABASE_SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY;
 const MP_ACCESS_TOKEN = process.env.MP_ACCESS_TOKEN;
 
+const BACKEND_PUBLIC_URL =
+  process.env.BACKEND_PUBLIC_URL || "https://vaga-facil-backend.onrender.com";
+
 const MP_PLAN_MENSAL =
   process.env.MP_PLAN_MENSAL || "ca92e94590464e44b834d5bb61454732";
 
@@ -57,7 +60,7 @@ function dadosDoPlano(plan) {
       titulo: "Vaga Fácil - Plano Mensal",
       planId: MP_PLAN_MENSAL,
       diasFallback: 35,
-      checkoutUrl:
+      planCheckoutUrl:
         "https://www.mercadopago.com.br/subscriptions/checkout?preapproval_plan_id=" +
         MP_PLAN_MENSAL
     };
@@ -69,7 +72,7 @@ function dadosDoPlano(plan) {
       titulo: "Vaga Fácil - Plano Trimestral",
       planId: MP_PLAN_TRIMESTRAL,
       diasFallback: 100,
-      checkoutUrl:
+      planCheckoutUrl:
         "https://www.mercadopago.com.br/subscriptions/checkout?preapproval_plan_id=" +
         MP_PLAN_TRIMESTRAL
     };
@@ -142,6 +145,26 @@ async function chamarMercadoPago(path, method = "GET", body = null) {
   }
 
   return data;
+}
+
+async function criarAssinaturaCheckout(plano, email, externalReference) {
+  const assinatura = await chamarMercadoPago("/preapproval", "POST", {
+    preapproval_plan_id: plano.planId,
+    payer_email: email,
+    external_reference: externalReference,
+    back_url: BACKEND_PUBLIC_URL
+  });
+
+  const checkoutUrl =
+    assinatura.init_point ||
+    assinatura.sandbox_init_point ||
+    assinatura.checkout_url ||
+    plano.planCheckoutUrl;
+
+  return {
+    assinatura,
+    checkoutUrl
+  };
 }
 
 async function buscarLicencaAtivaOutroAparelho(email, deviceId) {
@@ -322,6 +345,20 @@ async function processarAssinaturaMercadoPago(assinatura) {
     throw erroBusca;
   }
 
+  if (!licenca && assinatura.external_reference) {
+    const buscaRef = await supabase
+      .from("licenses")
+      .select("*")
+      .eq("external_reference", assinatura.external_reference)
+      .maybeSingle();
+
+    if (buscaRef.error) {
+      throw buscaRef.error;
+    }
+
+    licenca = buscaRef.data;
+  }
+
   if (!licenca) {
     const buscaPendente = await supabase
       .from("licenses")
@@ -426,14 +463,14 @@ app.get("/", (req, res) => {
     ok: true,
     app: "Vaga Fácil Backend",
     status: "online",
-    mode: "recurring-subscription"
+    mode: "recurring-subscription-v2"
   });
 });
 
 app.get("/health", (req, res) => {
   res.json({
     ok: true,
-    mode: "recurring-subscription",
+    mode: "recurring-subscription-v2",
     time: new Date().toISOString()
   });
 });
@@ -492,7 +529,7 @@ app.post("/api/create-checkout", async (req, res) => {
           plan: plano.plan,
           status: "pending",
           external_reference: externalReference,
-          checkout_url: plano.checkoutUrl,
+          checkout_url: null,
           mp_preapproval_id: null,
           expires_at: null
         },
@@ -505,12 +542,33 @@ app.post("/api/create-checkout", async (req, res) => {
       throw upsertError;
     }
 
+    const { assinatura, checkoutUrl } = await criarAssinaturaCheckout(
+      plano,
+      email,
+      externalReference
+    );
+
+    const { error: updateError } = await supabase
+      .from("licenses")
+      .update({
+        checkout_url: checkoutUrl,
+        mp_preapproval_id: assinatura.id || null
+      })
+      .eq("email", email)
+      .eq("device_id", deviceId);
+
+    if (updateError) {
+      throw updateError;
+    }
+
     return res.json({
       ok: true,
       recurring: true,
-      checkout_url: plano.checkoutUrl,
+      checkout_url: checkoutUrl,
       external_reference: externalReference,
+      preapproval_id: assinatura.id || null,
       plan: plano.plan,
+      status: assinatura.status || "pending",
       message:
         "Use no Mercado Pago o mesmo e-mail informado no app para liberar automaticamente."
     });
@@ -579,19 +637,45 @@ app.get("/api/check-license", async (req, res) => {
 
     if (!aindaAtiva) {
       try {
-        const resultado = await buscarAssinaturaAtivaPorEmail(
-          email,
-          data.plan
-        );
+        let ativada = null;
 
-        if (resultado) {
-          const ativada = await ativarLicencaComAssinatura({
+        if (data.mp_preapproval_id) {
+          const assinatura = await chamarMercadoPago(
+            `/preapproval/${data.mp_preapproval_id}`,
+            "GET"
+          );
+
+          const plano =
+            planoPorPlanId(assinatura.preapproval_plan_id) ||
+            dadosDoPlano(data.plan);
+
+          if (plano) {
+            ativada = await ativarLicencaComAssinatura({
+              email,
+              deviceId,
+              plano,
+              assinatura
+            });
+          }
+        }
+
+        if (!ativada || !ativada.active) {
+          const resultado = await buscarAssinaturaAtivaPorEmail(
             email,
-            deviceId,
-            plano: resultado.plano,
-            assinatura: resultado.assinatura
-          });
+            data.plan
+          );
 
+          if (resultado) {
+            ativada = await ativarLicencaComAssinatura({
+              email,
+              deviceId,
+              plano: resultado.plano,
+              assinatura: resultado.assinatura
+            });
+          }
+        }
+
+        if (ativada) {
           if (!ativada.ok) {
             return res.json({
               ok: true,
