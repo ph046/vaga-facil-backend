@@ -16,10 +16,8 @@ const SUPABASE_URL = process.env.SUPABASE_URL;
 const SUPABASE_SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY;
 const MP_ACCESS_TOKEN = process.env.MP_ACCESS_TOKEN;
 
-const MP_PLAN_MENSAL = process.env.MP_PLAN_MENSAL;
-const MP_PLAN_TRIMESTRAL = process.env.MP_PLAN_TRIMESTRAL;
-
-const PUBLIC_APP_URL = process.env.PUBLIC_APP_URL || "https://www.mercadopago.com.br";
+const BACKEND_PUBLIC_URL =
+  process.env.BACKEND_PUBLIC_URL || "https://vaga-facil-backend.onrender.com";
 
 if (!SUPABASE_URL || !SUPABASE_SERVICE_ROLE_KEY || !MP_ACCESS_TOKEN) {
   console.error("Erro: variáveis de ambiente obrigatórias ausentes.");
@@ -46,15 +44,15 @@ function criarHashCurto(texto) {
     .createHash("sha256")
     .update(texto)
     .digest("hex")
-    .slice(0, 16);
+    .slice(0, 18);
 }
 
 function dadosDoPlano(plan) {
   if (plan === "mensal") {
     return {
       plan: "mensal",
-      planId: MP_PLAN_MENSAL,
-      label: "Plano Mensal",
+      titulo: "Vaga Fácil - Plano Mensal",
+      valor: 9.99,
       dias: 35
     };
   }
@@ -62,8 +60,8 @@ function dadosDoPlano(plan) {
   if (plan === "trimestral") {
     return {
       plan: "trimestral",
-      planId: MP_PLAN_TRIMESTRAL,
-      label: "Plano Trimestral",
+      titulo: "Vaga Fácil - Plano Trimestral",
+      valor: 26.99,
       dias: 100
     };
   }
@@ -77,34 +75,13 @@ function adicionarDias(dias) {
   return data.toISOString();
 }
 
-function mapearStatusMercadoPago(statusMp) {
-  const status = String(statusMp || "").toLowerCase();
-
-  if (status === "authorized" || status === "active" || status === "approved") {
-    return "active";
-  }
-
-  if (status === "cancelled" || status === "canceled") {
-    return "cancelled";
-  }
-
-  if (status === "paused") {
-    return "paused";
-  }
-
-  if (status === "expired") {
-    return "expired";
-  }
-
-  return "pending";
-}
-
 async function chamarMercadoPago(path, method = "GET", body = null) {
   const response = await fetch(`https://api.mercadopago.com${path}`, {
     method,
     headers: {
       Authorization: `Bearer ${MP_ACCESS_TOKEN}`,
-      "Content-Type": "application/json"
+      "Content-Type": "application/json",
+      "X-Idempotency-Key": crypto.randomUUID()
     },
     body: body ? JSON.stringify(body) : undefined
   });
@@ -116,6 +93,63 @@ async function chamarMercadoPago(path, method = "GET", body = null) {
   }
 
   return data;
+}
+
+async function ativarLicencaPorReferencia(externalReference, paymentId = null) {
+  const { data: licenca, error: buscaErro } = await supabase
+    .from("licenses")
+    .select("*")
+    .eq("external_reference", externalReference)
+    .maybeSingle();
+
+  if (buscaErro) {
+    throw buscaErro;
+  }
+
+  if (!licenca) {
+    return {
+      updated: false,
+      reason: "Licença não encontrada."
+    };
+  }
+
+  const plano = dadosDoPlano(licenca.plan || "mensal");
+  const expiresAt = adicionarDias(plano ? plano.dias : 35);
+
+  const { error: updateError } = await supabase
+    .from("licenses")
+    .update({
+      status: "active",
+      expires_at: expiresAt,
+      mp_preapproval_id: paymentId ? String(paymentId) : licenca.mp_preapproval_id
+    })
+    .eq("external_reference", externalReference);
+
+  if (updateError) {
+    throw updateError;
+  }
+
+  return {
+    updated: true,
+    status: "active",
+    plan: licenca.plan,
+    expires_at: expiresAt
+  };
+}
+
+async function buscarPagamentoAprovadoPorReferencia(externalReference) {
+  const encodedRef = encodeURIComponent(externalReference);
+
+  const result = await chamarMercadoPago(
+    `/v1/payments/search?external_reference=${encodedRef}`,
+    "GET"
+  );
+
+  const pagamentos = Array.isArray(result.results) ? result.results : [];
+
+  return pagamentos.find((pagamento) => {
+    return String(pagamento.status || "").toLowerCase() === "approved";
+  });
 }
 
 app.get("/", (req, res) => {
@@ -133,16 +167,6 @@ app.get("/health", (req, res) => {
   });
 });
 
-/**
- * Cria o checkout de assinatura.
- *
- * Body:
- * {
- *   "email": "cliente@email.com",
- *   "deviceId": "android-id-do-cliente",
- *   "plan": "mensal" ou "trimestral"
- * }
- */
 app.post("/api/create-checkout", async (req, res) => {
   try {
     const email = limparEmail(req.body.email);
@@ -165,7 +189,7 @@ app.post("/api/create-checkout", async (req, res) => {
 
     const plano = dadosDoPlano(plan);
 
-    if (!plano || !plano.planId) {
+    if (!plano) {
       return res.status(400).json({
         ok: false,
         error: "Plano inválido."
@@ -175,47 +199,61 @@ app.post("/api/create-checkout", async (req, res) => {
     const baseRef = `${email}:${deviceId}:${plan}:${Date.now()}`;
     const externalReference = `vf_${criarHashCurto(baseRef)}`;
 
-    const registroPendente = {
-      email,
-      device_id: deviceId,
-      plan: plano.plan,
-      status: "pending",
-      external_reference: externalReference,
-      checkout_url: null,
-      mp_preapproval_id: null,
-      expires_at: null
-    };
-
     const { error: upsertError } = await supabase
       .from("licenses")
-      .upsert(registroPendente, {
-        onConflict: "email,device_id"
-      });
+      .upsert(
+        {
+          email,
+          device_id: deviceId,
+          plan: plano.plan,
+          status: "pending",
+          external_reference: externalReference,
+          checkout_url: null,
+          mp_preapproval_id: null,
+          expires_at: null
+        },
+        {
+          onConflict: "email,device_id"
+        }
+      );
 
     if (upsertError) {
       throw upsertError;
     }
 
-    const assinatura = await chamarMercadoPago("/preapproval", "POST", {
-      preapproval_plan_id: plano.planId,
-      reason: `Vaga Fácil - ${plano.label}`,
-      payer_email: email,
+    const preference = await chamarMercadoPago("/checkout/preferences", "POST", {
+      items: [
+        {
+          title: plano.titulo,
+          quantity: 1,
+          unit_price: plano.valor,
+          currency_id: "BRL"
+        }
+      ],
+      payer: {
+        email
+      },
       external_reference: externalReference,
-      back_url: PUBLIC_APP_URL
+      notification_url: `${BACKEND_PUBLIC_URL}/webhook/mercadopago`,
+      back_urls: {
+        success: BACKEND_PUBLIC_URL,
+        failure: BACKEND_PUBLIC_URL,
+        pending: BACKEND_PUBLIC_URL
+      },
+      auto_return: "approved",
+      statement_descriptor: "VAGA FACIL"
     });
 
     const checkoutUrl =
-      assinatura.init_point ||
-      assinatura.sandbox_init_point ||
-      assinatura.checkout_url ||
-      assinatura.url ||
+      preference.init_point ||
+      preference.sandbox_init_point ||
       null;
 
     const { error: updateError } = await supabase
       .from("licenses")
       .update({
-        mp_preapproval_id: assinatura.id || null,
-        checkout_url: checkoutUrl
+        checkout_url: checkoutUrl,
+        mp_preapproval_id: preference.id || null
       })
       .eq("external_reference", externalReference);
 
@@ -227,10 +265,13 @@ app.post("/api/create-checkout", async (req, res) => {
       ok: true,
       checkout_url: checkoutUrl,
       external_reference: externalReference,
-      mp_preapproval_id: assinatura.id || null
+      preference_id: preference.id || null
     });
   } catch (error) {
-    console.error("create-checkout error:", error);
+    console.error("create-checkout error:", {
+      message: String(error.message || error),
+      details: error
+    });
 
     return res.status(500).json({
       ok: false,
@@ -240,12 +281,6 @@ app.post("/api/create-checkout", async (req, res) => {
   }
 });
 
-/**
- * Verifica se o cliente está ativo.
- *
- * Query:
- * /api/check-license?email=cliente@email.com&deviceId=abc123
- */
 app.get("/api/check-license", async (req, res) => {
   try {
     const email = limparEmail(req.query.email);
@@ -261,7 +296,7 @@ app.get("/api/check-license", async (req, res) => {
 
     const { data, error } = await supabase
       .from("licenses")
-      .select("email, device_id, plan, status, expires_at, updated_at")
+      .select("email, device_id, plan, status, expires_at, updated_at, external_reference")
       .eq("email", email)
       .eq("device_id", deviceId)
       .maybeSingle();
@@ -280,11 +315,38 @@ app.get("/api/check-license", async (req, res) => {
       });
     }
 
+    let licencaAtual = data;
+
+    if (data.status !== "active" && data.external_reference) {
+      try {
+        const pagamentoAprovado = await buscarPagamentoAprovadoPorReferencia(
+          data.external_reference
+        );
+
+        if (pagamentoAprovado) {
+          const ativada = await ativarLicencaPorReferencia(
+            data.external_reference,
+            pagamentoAprovado.id
+          );
+
+          licencaAtual = {
+            ...data,
+            status: "active",
+            expires_at: ativada.expires_at
+          };
+        }
+      } catch (mpError) {
+        console.error("Erro ao consultar pagamento no Mercado Pago:", mpError);
+      }
+    }
+
     const agora = new Date();
-    const expira = data.expires_at ? new Date(data.expires_at) : null;
+    const expira = licencaAtual.expires_at
+      ? new Date(licencaAtual.expires_at)
+      : null;
 
     const active =
-      data.status === "active" &&
+      licencaAtual.status === "active" &&
       expira instanceof Date &&
       !Number.isNaN(expira.getTime()) &&
       expira > agora;
@@ -292,12 +354,15 @@ app.get("/api/check-license", async (req, res) => {
     return res.json({
       ok: true,
       active,
-      status: data.status,
-      plan: data.plan,
-      expires_at: data.expires_at
+      status: licencaAtual.status,
+      plan: licencaAtual.plan,
+      expires_at: licencaAtual.expires_at
     });
   } catch (error) {
-    console.error("check-license error:", error);
+    console.error("check-license error:", {
+      message: String(error.message || error),
+      details: error
+    });
 
     return res.status(500).json({
       ok: false,
@@ -307,11 +372,6 @@ app.get("/api/check-license", async (req, res) => {
   }
 });
 
-/**
- * Webhook do Mercado Pago.
- * Configure no Mercado Pago:
- * https://SEU_BACKEND.onrender.com/webhook/mercadopago
- */
 app.post("/webhook/mercadopago", async (req, res) => {
   try {
     const payload = req.body || {};
@@ -342,63 +402,63 @@ app.post("/webhook/mercadopago", async (req, res) => {
       return res.json({
         ok: true,
         ignored: true,
-        reason: "Sem ID do Mercado Pago no webhook."
+        reason: "Webhook sem ID do Mercado Pago."
       });
     }
 
-    const assinatura = await chamarMercadoPago(`/preapproval/${mpId}`, "GET");
+    const tipo = String(eventType).toLowerCase();
 
-    const externalReference = assinatura.external_reference;
+    if (!tipo.includes("payment") && !tipo.includes("pagamento")) {
+      return res.json({
+        ok: true,
+        ignored: true,
+        reason: "Evento não é de pagamento.",
+        eventType
+      });
+    }
+
+    const pagamento = await chamarMercadoPago(`/v1/payments/${mpId}`, "GET");
+
+    const status = String(pagamento.status || "").toLowerCase();
+    const externalReference = pagamento.external_reference;
 
     if (!externalReference) {
       return res.json({
         ok: true,
         ignored: true,
-        reason: "Assinatura sem external_reference."
+        reason: "Pagamento sem external_reference."
       });
     }
 
-    const plan =
-      assinatura.preapproval_plan_id === MP_PLAN_TRIMESTRAL
-        ? "trimestral"
-        : "mensal";
+    if (status !== "approved") {
+      await supabase
+        .from("licenses")
+        .update({
+          status: status === "cancelled" ? "cancelled" : "pending",
+          mp_preapproval_id: String(mpId)
+        })
+        .eq("external_reference", externalReference);
 
-    const status = mapearStatusMercadoPago(assinatura.status);
-
-    let expiresAt = null;
-
-    if (status === "active") {
-      if (assinatura.next_payment_date) {
-        expiresAt = new Date(assinatura.next_payment_date).toISOString();
-      } else {
-        expiresAt = adicionarDias(plan === "trimestral" ? 100 : 35);
-      }
-    }
-
-    const { error: updateError } = await supabase
-      .from("licenses")
-      .update({
-        plan,
+      return res.json({
+        ok: true,
+        updated: true,
         status,
-        mp_preapproval_id: assinatura.id || String(mpId),
-        expires_at: expiresAt
-      })
-      .eq("external_reference", externalReference);
-
-    if (updateError) {
-      throw updateError;
+        active: false
+      });
     }
+
+    const ativada = await ativarLicencaPorReferencia(externalReference, mpId);
 
     return res.json({
       ok: true,
-      updated: true,
-      external_reference: externalReference,
-      status,
-      plan,
-      expires_at: expiresAt
+      active: true,
+      ...ativada
     });
   } catch (error) {
-    console.error("webhook error:", error);
+    console.error("webhook error:", {
+      message: String(error.message || error),
+      details: error
+    });
 
     return res.status(500).json({
       ok: false,
