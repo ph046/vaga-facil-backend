@@ -16,11 +16,11 @@ const SUPABASE_URL = process.env.SUPABASE_URL;
 const SUPABASE_SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY;
 const MP_ACCESS_TOKEN = process.env.MP_ACCESS_TOKEN;
 
-const MP_PLAN_MENSAL =
-  process.env.MP_PLAN_MENSAL || "ca92e94590464e44b834d5bb61454732";
+const MP_PLAN_BASICO =
+  process.env.MP_PLAN_BASICO || "5e5d5796ec904347aaf2c5a0f1e11bdd";
 
-const MP_PLAN_TRIMESTRAL =
-  process.env.MP_PLAN_TRIMESTRAL || "9786832ee8224e78b048956df6963dc2";
+const MP_PLAN_COMPLETO =
+  process.env.MP_PLAN_COMPLETO || "7fddcb84ce184afdb279eef5862b7309";
 
 if (!SUPABASE_URL || !SUPABASE_SERVICE_ROLE_KEY || !MP_ACCESS_TOKEN) {
   console.error("Erro: variáveis de ambiente obrigatórias ausentes.");
@@ -50,28 +50,43 @@ function criarHashCurto(texto) {
     .slice(0, 18);
 }
 
+function normalizarPlano(plan) {
+  const plano = String(plan || "").trim().toLowerCase();
+
+  if (plano === "basico") return "basico";
+  if (plano === "completo") return "completo";
+
+  // Compatibilidade com versões antigas do app.
+  if (plano === "mensal") return "completo";
+  if (plano === "trimestral") return "completo";
+
+  return plano;
+}
+
 function dadosDoPlano(plan) {
-  if (plan === "mensal") {
+  const planoNormalizado = normalizarPlano(plan);
+
+  if (planoNormalizado === "basico") {
     return {
-      plan: "mensal",
-      titulo: "Vaga Fácil - Plano Mensal",
-      planId: MP_PLAN_MENSAL,
+      plan: "basico",
+      titulo: "Vaga Fácil - Plano Básico",
+      planId: MP_PLAN_BASICO,
       diasFallback: 35,
       checkoutUrl:
         "https://www.mercadopago.com.br/subscriptions/checkout?preapproval_plan_id=" +
-        MP_PLAN_MENSAL
+        MP_PLAN_BASICO
     };
   }
 
-  if (plan === "trimestral") {
+  if (planoNormalizado === "completo") {
     return {
-      plan: "trimestral",
-      titulo: "Vaga Fácil - Plano Trimestral",
-      planId: MP_PLAN_TRIMESTRAL,
-      diasFallback: 100,
+      plan: "completo",
+      titulo: "Vaga Fácil - Plano Completo",
+      planId: MP_PLAN_COMPLETO,
+      diasFallback: 35,
       checkoutUrl:
         "https://www.mercadopago.com.br/subscriptions/checkout?preapproval_plan_id=" +
-        MP_PLAN_TRIMESTRAL
+        MP_PLAN_COMPLETO
     };
   }
 
@@ -79,8 +94,8 @@ function dadosDoPlano(plan) {
 }
 
 function planoPorPlanId(planId) {
-  if (planId === MP_PLAN_MENSAL) return dadosDoPlano("mensal");
-  if (planId === MP_PLAN_TRIMESTRAL) return dadosDoPlano("trimestral");
+  if (planId === MP_PLAN_BASICO) return dadosDoPlano("basico");
+  if (planId === MP_PLAN_COMPLETO) return dadosDoPlano("completo");
   return null;
 }
 
@@ -219,12 +234,12 @@ async function buscarAssinaturaAtivaPorEmail(email, planoPreferido = null) {
     if (plano) planos.push(plano);
   }
 
-  if (!planos.some((p) => p.plan === "mensal")) {
-    planos.push(dadosDoPlano("mensal"));
+  if (!planos.some((p) => p.plan === "basico")) {
+    planos.push(dadosDoPlano("basico"));
   }
 
-  if (!planos.some((p) => p.plan === "trimestral")) {
-    planos.push(dadosDoPlano("trimestral"));
+  if (!planos.some((p) => p.plan === "completo")) {
+    planos.push(dadosDoPlano("completo"));
   }
 
   for (const plano of planos) {
@@ -271,7 +286,8 @@ async function ativarLicencaComAssinatura({
       plan: plano.plan,
       status,
       mp_preapproval_id: assinatura.id || null,
-      expires_at: expiresAt
+      expires_at: expiresAt,
+      updated_at: new Date().toISOString()
     })
     .eq("email", email)
     .eq("device_id", deviceId);
@@ -346,9 +362,25 @@ async function processarAssinaturaMercadoPago(assinatura) {
   }
 
   if (!licenca) {
+    const buscaPorEmail = await supabase
+      .from("licenses")
+      .select("*")
+      .eq("email", email)
+      .in("status", ["pending", "active", "paused"])
+      .order("updated_at", { ascending: false })
+      .limit(1);
+
+    if (buscaPorEmail.error) {
+      throw buscaPorEmail.error;
+    }
+
+    licenca = buscaPorEmail.data && buscaPorEmail.data[0];
+  }
+
+  if (!licenca) {
     return {
       updated: false,
-      reason: "Nenhuma licença pendente encontrada para esse e-mail."
+      reason: "Nenhuma licença encontrada para esse e-mail."
     };
   }
 
@@ -358,7 +390,8 @@ async function processarAssinaturaMercadoPago(assinatura) {
       plan: plano.plan,
       status,
       mp_preapproval_id: assinatura.id || null,
-      expires_at: expiresAt
+      expires_at: expiresAt,
+      updated_at: new Date().toISOString()
     })
     .eq("id", licenca.id);
 
@@ -397,7 +430,7 @@ async function processarPagamentoMercadoPago(pagamento) {
 
   const { assinatura, plano } = resultado;
 
-  const { data: licencas, error } = await supabase
+  let { data: licencas, error } = await supabase
     .from("licenses")
     .select("*")
     .eq("email", email)
@@ -410,7 +443,23 @@ async function processarPagamentoMercadoPago(pagamento) {
     throw error;
   }
 
-  const licenca = licencas && licencas[0];
+  let licenca = licencas && licencas[0];
+
+  if (!licenca) {
+    const buscaPorEmail = await supabase
+      .from("licenses")
+      .select("*")
+      .eq("email", email)
+      .in("status", ["pending", "active", "paused"])
+      .order("updated_at", { ascending: false })
+      .limit(1);
+
+    if (buscaPorEmail.error) {
+      throw buscaPorEmail.error;
+    }
+
+    licenca = buscaPorEmail.data && buscaPorEmail.data[0];
+  }
 
   if (!licenca) {
     return {
@@ -432,14 +481,19 @@ app.get("/", (req, res) => {
     ok: true,
     app: "Vaga Fácil Backend",
     status: "online",
-    mode: "recurring-subscription-v3-plan-link"
+    mode: "free-2d-basico-completo-v1",
+    plans: {
+      gratis: "2 dias",
+      basico: "3 dias",
+      completo: "7 dias"
+    }
   });
 });
 
 app.get("/health", (req, res) => {
   res.json({
     ok: true,
-    mode: "recurring-subscription-v3-plan-link",
+    mode: "free-2d-basico-completo-v1",
     time: new Date().toISOString()
   });
 });
@@ -448,7 +502,7 @@ app.post("/api/create-checkout", async (req, res) => {
   try {
     const email = limparEmail(req.body.email);
     const deviceId = limparDeviceId(req.body.deviceId);
-    const plan = String(req.body.plan || "").trim().toLowerCase();
+    const plan = normalizarPlano(req.body.plan);
 
     if (!email || !email.includes("@")) {
       return res.status(400).json({
@@ -486,29 +540,68 @@ app.post("/api/create-checkout", async (req, res) => {
       });
     }
 
-    const baseRef = `${email}:${deviceId}:${plan}:${Date.now()}`;
+    const baseRef = `${email}:${deviceId}:${plano.plan}:${Date.now()}`;
     const externalReference = `vf_${criarHashCurto(baseRef)}`;
 
-    const { error: upsertError } = await supabase
+    const { data: existente, error: erroExistente } = await supabase
       .from("licenses")
-      .upsert(
-        {
-          email,
-          device_id: deviceId,
-          plan: plano.plan,
-          status: "pending",
+      .select("id, plan, status, expires_at")
+      .eq("email", email)
+      .eq("device_id", deviceId)
+      .maybeSingle();
+
+    if (erroExistente) {
+      throw erroExistente;
+    }
+
+    const agora = new Date();
+    const expiraExistente = existente?.expires_at
+      ? new Date(existente.expires_at)
+      : null;
+
+    const existenteAtiva =
+      existente &&
+      existente.status === "active" &&
+      expiraExistente instanceof Date &&
+      !Number.isNaN(expiraExistente.getTime()) &&
+      expiraExistente > agora;
+
+    if (existenteAtiva) {
+      const { error: updateError } = await supabase
+        .from("licenses")
+        .update({
           external_reference: externalReference,
           checkout_url: plano.checkoutUrl,
-          mp_preapproval_id: null,
-          expires_at: null
-        },
-        {
-          onConflict: "email,device_id"
-        }
-      );
+          updated_at: new Date().toISOString()
+        })
+        .eq("id", existente.id);
 
-    if (upsertError) {
-      throw upsertError;
+      if (updateError) {
+        throw updateError;
+      }
+    } else {
+      const { error: upsertError } = await supabase
+        .from("licenses")
+        .upsert(
+          {
+            email,
+            device_id: deviceId,
+            plan: plano.plan,
+            status: "pending",
+            external_reference: externalReference,
+            checkout_url: plano.checkoutUrl,
+            mp_preapproval_id: null,
+            expires_at: null,
+            updated_at: new Date().toISOString()
+          },
+          {
+            onConflict: "email,device_id"
+          }
+        );
+
+      if (upsertError) {
+        throw upsertError;
+      }
     }
 
     return res.json({
@@ -570,7 +663,10 @@ app.get("/api/check-license", async (req, res) => {
       });
     }
 
-    let licencaAtual = data;
+    let licencaAtual = {
+      ...data,
+      plan: normalizarPlano(data.plan)
+    };
 
     const agora = new Date();
     const expiraAtual = licencaAtual.expires_at
@@ -663,7 +759,7 @@ app.get("/api/check-license", async (req, res) => {
       ok: true,
       active,
       status: licencaAtual.status,
-      plan: licencaAtual.plan,
+      plan: normalizarPlano(licencaAtual.plan),
       expires_at: licencaAtual.expires_at
     });
   } catch (error) {
